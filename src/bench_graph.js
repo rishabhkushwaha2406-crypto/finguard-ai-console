@@ -1,0 +1,83 @@
+
+/* ============================================================
+   Benchmark graph analytics (accounts as nodes, TRANSFER and CASH_OUT as edges)
+   ============================================================ */
+function buildBenchGraph(S) {
+  const id = new Map(), accts = [], L = a => { let k = id.get(a); if (k === undefined) { k = accts.length; id.set(a, k); accts.push(a); } return k; };
+  const ek = new Map(), E = { a: [], b: [], n: [], amt: [], fr: [], ty: [], rows: [] };
+  for (let i = 0; i < S.n; i++) { const t = S.type[i]; if (t !== 1 && t !== 2) continue; const a = L(S.orig[i]), b = L(S.dest[i]), key = a * 2097152 + b; let e = ek.get(key); if (e === undefined) { e = E.a.length; ek.set(key, e); E.a.push(a); E.b.push(b); E.n.push(0); E.amt.push(0); E.fr.push(0); E.ty.push(0); E.rows.push([]); } E.n[e]++; E.amt[e] += S.amount[i]; E.fr[e] += S.fraud[i]; E.ty[e] |= t; if (E.rows[e].length < 4) E.rows[e].push(i); }
+  const N = accts.length, M = E.a.length, inD = new Int32Array(N), outD = new Int32Array(N), inAmt = new Float64Array(N), outAmt = new Float64Array(N);
+  for (let e = 0; e < M; e++) { outD[E.a[e]]++; inD[E.b[e]]++; outAmt[E.a[e]] += E.amt[e]; inAmt[E.b[e]] += E.amt[e]; }
+  const par = new Int32Array(N); for (let i = 0; i < N; i++) par[i] = i; const find = x => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+  for (let e = 0; e < M; e++) { const x = find(E.a[e]), y = find(E.b[e]); if (x !== y) par[x] = y; }
+  const root = new Int32Array(N), csize = new Map(); for (let i = 0; i < N; i++) { root[i] = find(i); csize.set(root[i], (csize.get(root[i]) || 0) + 1); }
+  // PageRank
+  let pr = new Float64Array(N).fill(1 / N); for (let it = 0; it < 25; it++) { const nx = new Float64Array(N).fill(.15 / N); let dang = 0; for (let i = 0; i < N; i++) if (!outD[i]) dang += pr[i]; for (let e = 0; e < M; e++) nx[E.b[e]] += .85 * pr[E.a[e]] / outD[E.a[e]]; const add = .85 * dang / N; for (let i = 0; i < N; i++) nx[i] += add; pr = nx; }
+  // undirected CSR and label propagation
+  const off = new Int32Array(N + 1); for (let e = 0; e < M; e++) { off[E.a[e] + 1]++; off[E.b[e] + 1]++; } for (let i = 0; i < N; i++) off[i + 1] += off[i]; const adj = new Int32Array(off[N]), cur = off.slice(0, N); for (let e = 0; e < M; e++) { adj[cur[E.a[e]]++] = E.b[e]; adj[cur[E.b[e]]++] = E.a[e]; }
+  const lab = new Int32Array(N); for (let i = 0; i < N; i++) lab[i] = i; for (let it = 0; it < 6; it++) { let ch = 0; for (let v = 0; v < N; v++) { if (off[v + 1] - off[v] < 2) continue; const cnt = new Map(); for (let k = off[v]; k < off[v + 1]; k++) cnt.set(lab[adj[k]], (cnt.get(lab[adj[k]]) || 0) + 1); let best = lab[v], bc = 0; cnt.forEach((c, l) => { if (c > bc || (c === bc && l < best)) { bc = c; best = l; } }); if (best !== lab[v]) { lab[v] = best; ch++; } } if (!ch) break; }
+  const csz = new Map(); for (let i = 0; i < N; i++) csz.set(lab[i], (csz.get(lab[i]) || 0) + 1);
+  // chains: TRANSFER followed by a matching CASH_OUT from the destination
+  const chains = []; const mule = new Uint8Array(N), victim = new Uint8Array(N);
+  for (let i = 0; i < S.n; i++) if (S.type[i] === 1) { const j = chainPartner(S, i); if (j != null && S.type[j] === 2) { chains.push({ t: i, c: j }); mule[id.get(S.dest[i])] = 1; victim[id.get(S.orig[i])] = 1; } }
+  const fraudT = (() => { let c = 0; for (let i = 0; i < S.n; i++) if (S.type[i] === 1 && S.fraud[i]) c++; return c; })(), chainFraud = chains.filter(c => S.fraud[c.t]).length;
+  const score = new Float64Array(N); for (let i = 0; i < N; i++) { const pass = inAmt[i] > 0 && outAmt[i] > 0 ? Math.min(1, outAmt[i] / inAmt[i]) : 0; score[i] = (mule[i] ? 55 : 0) + (victim[i] ? 20 : 0) + (inD[i] >= 3 ? 15 : inD[i] === 2 ? 6 : 0) + (pass >= .9 ? 20 : 0); score[i] = Math.min(100, score[i]); }
+  // clusters of weakly connected accounts that contain a chain
+  const cl = new Map(); chains.forEach(c => { const r = root[id.get(S.dest[c.t])]; let o = cl.get(r); if (!o) cl.set(r, o = { root: r, chains: 0, fraud: 0, value: 0 }); o.chains++; o.value += S.amount[c.t]; o.fraud += S.fraud[c.t] ? 1 : 0; });
+  const clusters = [...cl.values()].map(o => ({ ...o, size: csize.get(o.root), id: 'K' + o.root })).sort((a, b) => b.fraud / b.size - a.fraud / a.size || b.value - a.value);
+  const top = [...Array(N).keys()].sort((a, b) => score[b] - score[a]).slice(0, 100);
+  const fraudAcct = new Uint8Array(N); for (let e = 0; e < M; e++) if (E.fr[e]) { fraudAcct[E.a[e]] = 1; fraudAcct[E.b[e]] = 1; }
+  const topHit = top.filter(i => fraudAcct[i]).length;
+  const prRank = [...Array(N).keys()].sort((a, b) => pr[b] - pr[a]).slice(0, 8), fanIn = [...Array(N).keys()].sort((a, b) => inD[b] - inD[a]).slice(0, 8);
+  const biggest = Math.max(...csize.values()), commSizes = [...csz.values()].sort((a, b) => b - a);
+  return { id, accts, E, N, M, inD, outD, inAmt, outAmt, root, csize, pr, lab, csz, off, adj, chains, mule, victim, score, clusters, fraudT, chainFraud, topHit, prRank, fanIn, biggest, commSizes, fraudAcct };
+}
+function benchShim(S, G, edgeIdx, focus) {
+  const nodes = [], seen = new Set(), edges = [], deg = {}; const add = a => { if (!seen.has(a)) { seen.add(a); nodes.push({ id: S.names[G.accts[a] ?? a] ?? String(a), type: 'cust', label: S.names[G.accts[a]] }); } };
+  const nm = a => S.names[G.accts[a]];
+  edgeIdx.forEach(e => { const a = G.E.a[e], b = G.E.b[e]; add(a); add(b); edges.push({ a: nm(a), b: nm(b), type: G.E.ty[e] & 2 && !(G.E.ty[e] & 1) ? 'cashout' : 'transfer', n: G.E.n[e], amt: G.E.amt[e], fraud: G.E.fr[e] }); deg[nm(a)] = (deg[nm(a)] || 0) + 1; deg[nm(b)] = (deg[nm(b)] || 0) + 1; });
+  nodes.forEach(n => { const a = G.id.get(S.nameIdx.get(n.id)); n.a = a; });
+  const central = {}, risk = {}, mules = {}, compOf = {}; nodes.forEach(n => { central[n.id] = (deg[n.id] || 0) / Math.max(nodes.length - 1, 1); const sc = G.score[n.a], bd = sc >= 75 ? 'Critical' : sc >= 50 ? 'High' : sc >= 25 ? 'Medium' : 'Low'; risk[n.id] = { band: bd, score: Math.round(sc) }; if (G.mule[n.a]) mules[n.id] = { indicators: ['Receives a transfer and passes it on'], strength: 'Chain participant' }; compOf[n.id] = 'K1'; });
+  return { graph: { nodes, edges, comps: [{ id: 'K1', members: nodes.map(n => n.id) }], compOf, central, inCyc: {}, cycNodes: new Set(), mules, deg }, risk, cm: {} };
+}
+function egoEdges(G, a0, hops = 2, cap = 120) { const seen = new Set([a0]); let front = [a0]; const eidx = new Set(); const byNode = G._byNode || (G._byNode = (() => { const m = new Map(); for (let e = 0; e < G.M; e++) { for (const x of [G.E.a[e], G.E.b[e]]) { let l = m.get(x); if (!l) m.set(x, l = []); l.push(e); } } return m; })());
+  for (let h = 0; h < hops; h++) { const nx = []; for (const a of front) { for (const e of (byNode.get(a) || []).slice(0, 40)) { if (seen.size >= cap && !(seen.has(G.E.a[e]) && seen.has(G.E.b[e]))) continue; eidx.add(e); for (const b of [G.E.a[e], G.E.b[e]]) if (!seen.has(b) && seen.size < cap) { seen.add(b); nx.push(b); } } } front = nx; } return [...eidx]; }
+function clusterEdges(S, G, root) { const byNode = (egoEdges(G, 0, 0), G._byNode), out = new Set(); const rows = G.chains.filter(c => G.root[G.id.get(S.dest[c.t])] === root);
+  for (const c of rows) { const m = G.id.get(S.dest[c.t]), o = G.id.get(S.orig[c.t]); for (const x of [m, o]) for (const e of (byNode.get(x) || []).slice(0, 8)) if (out.size < 220) out.add(e); } return [...out]; }
+
+function BenchNodeInfo({ S, G, id }) {
+  const app = useApp(), k = S.nameIdx.get(id), a = k != null ? G.id.get(k) : null; if (a == null) return html`<div className="muted">Select an account to see its relationships.</div>`;
+  const sc = G.score[a], bd = sc >= 75 ? 'Critical' : sc >= 50 ? 'High' : sc >= 25 ? 'Medium' : 'Low', rank = [...G.pr].filter(v => v > G.pr[a]).length + 1, ai = acctIndex(S), rows = (ai.get(k) || []).slice(0, 6);
+  const why = []; if (G.mule[a]) why.push('Receives a transfer and a matching cash-out leaves the same account'); if (G.victim[a]) why.push('Origin of a transfer that was cashed out downstream'); if (G.inD[a] >= 3) why.push(`${G.inD[a]} distinct senders`); if (G.inAmt[a] > 0 && G.outAmt[a] > 0 && G.outAmt[a] / G.inAmt[a] >= .9) why.push('Passes on at least 90% of what it receives');
+  return html`<div style=${{ display: 'flex', flexDirection: 'column', gap: 12 }}><div><b className="mono" style=${{ fontSize: 16 }}>${id}</b><div className="muted" style=${{ fontSize: 12 }}>${id[0] === 'M' ? 'Merchant account' : 'Customer account'}</div></div><div style=${{ display: 'flex', gap: 8, flexWrap: 'wrap' }}><${Band} b=${bd}/><${Pill} plain>lead score ${Math.round(sc)}<//><${Pill} plain>PageRank #${rank.toLocaleString()}<//><${Pill} plain>component ${G.csize.get(G.root[a])} accounts<//><${Pill} plain>community ${G.csz.get(G.lab[a])}<//></div>
+    <${KV} rows=${[['Senders', G.inD[a]], ['Recipients', G.outD[a]], ['Received', fmtN(G.inAmt[a])], ['Sent', fmtN(G.outAmt[a])]]}/>
+    ${why.length ? html`<div><div className="sect-t">Why it is a lead</div><ul className="evl">${why.map(w => html`<li key=${w}>${w}</li>`)}</ul><div className="faint" style=${{ fontSize: 11, marginTop: 6 }}>Leads are patterns to review. They are not findings, and the score ignores the fraud label.</div></div>` : html`<${Note}>No lead indicators on this account.<//>`}
+    <div><div className="sect-t">Rows involving this account</div><div className="tw"><table className="tbl"><tbody>${rows.map(j => html`<tr key=${j} className="r" onClick=${() => app.open('btx', j)}><td className="mono">#${j + 1}</td><td>${PS_TYPES[S.type[j]]}</td><td className="right mono">${fmtN(S.amount[j])}</td><td>${S.fraud[j] ? html`<${Pill} tone="crit">fraud<//>` : ''}</td></tr>`)}</tbody></table></div></div>
+    <div style=${{ display: 'flex', gap: 8, flexWrap: 'wrap' }}><${Btn} sm onClick=${() => app.setBenchFocus(id)}>Show neighbourhood<//>${rows[0] != null && html`<${Btn} sm kind="primary" icon="plus" onClick=${() => { const c = app.createBenchCase(rows[0]); app.open('case', c.id); }}>Open case<//>`}</div></div>`;
+}
+
+function BenchGraph() {
+  const app = useApp(), { bench, benchBusy } = app, S = bench.ds; const [mode, setMode] = useState('cluster'), [rootSel, setRoot] = useState(null), [sel, setSel] = useState(null), [q, setQ] = useState(''), [flags, setFlags] = useState({ transfer: true, cashout: true, device: true, beneficiary: true });
+  const G = useMemo(() => S && S.kind === 'paysim' ? (S._g || (S._g = buildBenchGraph(S))) : null, [S]);
+  useEffect(() => { if (G && G.clusters.length && rootSel == null) setRoot(G.clusters[0].root); }, [G]);
+  useEffect(() => { if (app.benchFocus && G) { setMode('ego'); setQ(app.benchFocus); setSel(app.benchFocus); } }, [app.benchFocus, G]);
+  const egoK = G && mode === 'ego' && q ? S.nameIdx.get(q.trim()) : null, egoA = egoK != null ? G.id.get(egoK) : null;
+  const edgeIdx = useMemo(() => !G ? [] : egoA != null ? egoEdges(G, egoA) : rootSel != null ? clusterEdges(S, G, rootSel) : [], [G, egoA, rootSel, mode]);
+  const shim = useMemo(() => G ? benchShim(S, G, edgeIdx) : null, [S, G, edgeIdx]);
+  if (!S) return html`<section><${PageHead} title="Graph Intelligence" sub="Account-level network analysis over benchmark transactions."><${SourceSeg}/></${PageHead}><${BenchLoader}/></section>`;
+  if (!G) return html`<section><${PageHead} title="Graph Intelligence"><${SourceSeg}/></${PageHead}><${Panel}><p className="muted">The Credit Card Fraud dataset has no account or counterparty identifiers, so no network can be built from it. Load a PaySim file or the PaySim-style benchmark.</p><div style=${{ marginTop: 12 }}><${BenchLoader}/></div><//></section>`;
+
+  const nodeSel = sel && shim.graph.nodes.some(n => n.id === sel) ? sel : (egoA != null ? q.trim() : (shim.graph.nodes.find(n => shim.graph.mules[n.id]) || shim.graph.nodes[0] || {}).id);
+  const ch = G.chains.length, prec = ch ? G.chainFraud / ch : 0, cov = G.fraudT ? G.chainFraud / G.fraudT : 0, acctNm = a => S.names[G.accts[a]];
+  const stat = (l, v, s) => html`<div className="kpi" key=${l}><div className="l">${l}</div><div className="v num">${v}</div><div className="s">${s}</div></div>`;
+  return html`<section><${PageHead} title="Graph Intelligence" sub=${`Accounts as nodes, TRANSFER and CASH_OUT as edges. Built from ${S.n.toLocaleString()} ${S.meta.synthetic ? 'simulated' : 'imported'} rows in your browser.`}><${SourceSeg}/></${PageHead}>
+    <div className="kpis" style=${{ gridTemplateColumns: 'repeat(6,1fr)' }}>${[stat('Accounts', G.N.toLocaleString(), 'in transfer or cash-out'), stat('Edges', G.M.toLocaleString(), 'distinct account pairs'), stat('Components', G.csize.size.toLocaleString(), `largest ${G.biggest.toLocaleString()}`), stat('Communities', [...G.csz.values()].filter(v => v >= 3).length.toLocaleString(), 'label propagation, size ≥ 3'), stat('Chains', ch, 'transfer → matching cash-out'), stat('Leads', G.clusters.length, 'clusters with a chain')]}</div>
+    <div className="filters" style=${{ margin: '14px 0 10px' }}><${Seg} label="View" options=${[['cluster', 'Suspect clusters'], ['ego', 'Account neighbourhood']]} value=${mode} onChange=${setMode}/>${mode === 'ego' && html`<input className="input" style=${{ width: 220 }} placeholder="Account, e.g. C123456789" value=${q} onChange=${e => { setQ(e.target.value); app.setBenchFocus(null); }} aria-label="Account"/>`}${[['transfer', 'Transfers'], ['cashout', 'Cash-outs']].map(([k, l]) => html`<label key=${k} className="chk"><input type="checkbox" checked=${flags[k]} onChange=${e => setFlags(f => ({ ...f, [k]: e.target.checked }))}/>${l}</label>`)}<span className="faint" style=${{ fontSize: 12 }}>${shim.graph.nodes.length} nodes · ${shim.graph.edges.length} edges shown${edgeIdx.length >= 220 ? ' (capped)' : ''}</span></div>
+    ${mode === 'ego' && egoA == null && q.trim() && html`<${Note}>No account named “${q.trim()}” in this dataset. Try the one shown in a row’s drawer.<//>`}
+    <div className="grid" style=${{ gridTemplateColumns: 'minmax(0,1fr) 340px', marginTop: 0 }}>${shim.graph.nodes.length ? html`<${GraphCanvas} data=${shim} selected=${nodeSel} onSelect=${setSel} height=${540} flags=${flags}/>` : html`<${Panel}><p className="muted">Nothing to draw yet. Pick a cluster or enter an account.</p><//>`}<${Panel} title="Selected account"><${BenchNodeInfo} S=${S} G=${G} id=${nodeSel}/><//></div>
+    <div className="grid g2"><${Panel} title="Suspect clusters" small="Connected groups with a pass-through chain, densest first. Large groups show only the chain neighbourhood." flush><${DataTable} pageSize=${7} rows=${G.clusters.map(c => ({ ...c, id: c.root }))} onRow=${r => { setRoot(r.root); setMode('cluster'); app.setBenchFocus(null); setSel(null); }} stripe=${r => r.root === rootSel && mode === 'cluster' ? 'var(--accent)' : 'transparent'} columns=${[{ key: 'id', label: 'Cluster', render: r => 'K' + r.root, mono: true }, { key: 'size', label: 'Accounts', align: 'right', mono: true }, { key: 'chains', label: 'Chains', align: 'right', mono: true }, { key: 'value', label: 'Value', align: 'right', mono: true, render: r => fmtN(r.value) }, { key: 'fraud', label: 'Fraud-labelled', align: 'right', mono: true }]}/><//>
+      <div style=${{ display: 'flex', flexDirection: 'column', gap: 16 }}><${Panel} title="How good is the chain rule?" small="Checked against the labels on file"><${KV} rows=${[['Chains found', ch], ['Fraud-labelled transfers', G.fraudT], ['Chains that are labelled fraud', `${G.chainFraud} (${pct(prec, 1)} precision)`], ['Fraud transfers covered', pct(cov, 1)], ['Top 100 lead accounts touching fraud', `${G.topHit} of 100`]]}/><div className="faint" style=${{ fontSize: 11, marginTop: 8 }}>Legitimate transfers are often moved on too, so the rule is a prioritiser and not a verdict.</div><//>
+        <${Panel} title="Highest PageRank"><${HBars} rows=${G.prRank.map(a => ({ label: acctNm(a), value: G.pr[a] * G.N, id: acctNm(a) }))} fmt=${v => v.toFixed(1) + '×'} onRow=${r => { setMode('ego'); setQ(r.id); setSel(r.id); }}/><//></div></div>
+    <div className="grid g2e"><${Panel} title="Largest fan-in" small="Accounts paid by the most distinct senders"><${HBars} rows=${G.fanIn.map(a => ({ label: acctNm(a), value: G.inD[a], id: acctNm(a) }))} onRow=${r => { setMode('ego'); setQ(r.id); setSel(r.id); }} color="var(--violet)"/><//><${Panel} title="Community sizes" small="Label propagation over the full account graph"><${HBars} rows=${G.commSizes.slice(0, 8).map((v, i) => ({ label: 'Community ' + (i + 1), value: v }))} fmt=${v => v.toLocaleString()}/><//></div></section>`;
+}
+function GraphPage() { const app = useApp(); return app.txSrc === 'bench' ? html`<${BenchGraph}/>` : html`<${DemoGraph}/>`; }
